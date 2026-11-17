@@ -1050,3 +1050,173 @@ Review
     ↓
 Verified Code
 ```
+
+
+# 29. Building the VSIX
+
+The VSIX package can be built locally from the source repository.
+
+## Prerequisites
+
+Install Node.js and npm.
+
+Verify:
+
+```bash
+node --version
+npm --version
+```
+
+Install the VS Code Extension Manager (`vsce`):
+
+```bash
+npm install --global @vscode/vsce
+```
+
+Verify:
+
+```bash
+vsce --version
+```
+
+## Build the VSIX
+
+Clone or check out the Copilot Smart source repository and enter the project directory:
+
+```bash
+cd copilot-smart-vscode
+```
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Before packaging, check the extension JavaScript:
+
+```bash
+node --check extension/extension.js
+```
+
+Then build the VSIX:
+
+```bash
+vsce package
+```
+
+This creates a file similar to:
+
+```text
+copilot-smart-2.2.2.vsix
+```
+
+The version is taken from `package.json`.
+
+## Install the locally built VSIX
+
+From VS Code:
+
+```text
+Ctrl+Shift+P
+    ↓
+Extensions: Install from VSIX...
+    ↓
+Select copilot-smart-<version>.vsix
+```
+
+Or from the command line:
+
+```bash
+code --install-extension copilot-smart-2.2.2.vsix
+```
+
+Then reload VS Code:
+
+```text
+Ctrl+Shift+P
+    ↓
+Developer: Reload Window
+```
+
+## Build and install in one workflow
+
+A typical development workflow is:
+
+```bash
+npm install
+node --check extension/extension.js
+vsce package
+code --install-extension copilot-smart-2.2.2.vsix
+```
+
+Then reload VS Code.
+
+## Packaging checks
+
+Before creating a release build, verify:
+
+```bash
+node --check extension/extension.js
+```
+
+Check the extension metadata:
+
+```bash
+cat package.json
+```
+
+Make sure the following are correct:
+
+- `name`
+- `displayName`
+- `version`
+- `main`
+- `activationEvents`
+- `contributes.commands`
+- `contributes.viewsContainers`
+- Activity Bar icon path
+- Commands used by the extension
+
+For example:
+
+```json
+{
+  "main": "./extension/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:copilot-smart.controlCenter",
+    "onCommand:copilot-smart.openSettings"
+  ]
+}
+```
+
+## Release checklist
+
+Before committing a new VSIX release:
+
+```text
+[ ] Update version in package.json
+[ ] Update README if behavior changed
+[ ] Run npm install
+[ ] Run node --check extension/extension.js
+[ ] Run vsce package
+[ ] Install the generated VSIX
+[ ] Reload VS Code
+[ ] Check Activity Bar icon
+[ ] Check status-bar icon
+[ ] Check Settings command
+[ ] Detect local providers
+[ ] Discover models
+[ ] Select a local model
+[ ] Test connection
+[ ] Run Smart Local Task
+[ ] Verify Git changes
+```
+
+## Important
+
+The generated `.vsix` file is a distributable extension package. The source code remains the authoritative development version.
+
+Do not commit large generated `.vsix` files to the source repository unless the project's release process specifically requires it. Prefer publishing the VSIX as a release artifact and keeping the source repository focused on the extension source and build configuration.
+
