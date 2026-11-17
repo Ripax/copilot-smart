@@ -1,0 +1,177 @@
+{
+  "name": "copilot-smart",
+  "displayName": "Copilot Smart",
+  "description": "Use local Ollama, LM Studio, llama.cpp, or OpenAI-compatible local LLMs with strict-local controls.",
+  "version": "2.2.2",
+  "publisher": "anbi",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:copilot-smart.controlCenter",
+    "onCommand:copilot-smart.openSettings"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "copilot-smart.openSettings",
+        "title": "Copilot Smart: Open Settings",
+        "category": "Copilot Smart"
+      },
+      {
+        "command": "copilot-smart.detect",
+        "title": "Copilot Smart: Detect Local LLMs"
+      },
+      {
+        "command": "copilot-smart.models",
+        "title": "Copilot Smart: Discover Models"
+      },
+      {
+        "command": "copilot-smart.testConnection",
+        "title": "Copilot Smart: Test Connection"
+      },
+      {
+        "command": "copilot-smart.generateProvider",
+        "title": "Copilot Smart: Generate provider.json"
+      },
+      {
+        "command": "copilot-smart.status",
+        "title": "Copilot Smart: Status"
+      },
+      {
+        "command": "copilot-smart.startTask",
+        "title": "Copilot Smart: Smart Local Task"
+      },
+      {
+        "command": "copilot-smart.refreshStatus",
+        "title": "Copilot Smart: Refresh Connection Status"
+      },
+      {
+        "command": "copilot-smart.refreshModels",
+        "title": "Copilot Smart: Refresh Models"
+      }
+    ],
+    "configuration": {
+      "title": "Copilot Smart",
+      "properties": {
+        "copilot-smart.mode": {
+          "type": "string",
+          "enum": [
+            "strict-local",
+            "local-preferred"
+          ],
+          "default": "strict-local",
+          "description": "strict-local never falls back to cloud/Copilot when the local model is unavailable."
+        },
+        "copilot-smart.provider": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "ollama",
+            "lm-studio",
+            "llama.cpp",
+            "openai-compatible"
+          ],
+          "default": "auto"
+        },
+        "copilot-smart.host": {
+          "type": "string",
+          "default": "127.0.0.1"
+        },
+        "copilot-smart.port": {
+          "type": "number",
+          "default": 11434
+        },
+        "copilot-smart.basePath": {
+          "type": "string",
+          "default": "/v1"
+        },
+        "copilot-smart.model": {
+          "type": "string",
+          "default": ""
+        },
+        "copilot-smart.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional API key for OpenAI-compatible servers."
+        },
+        "copilot-smart.timeoutMs": {
+          "type": "number",
+          "default": 120000
+        },
+        "copilot-smart.maxOutputTokens": {
+          "type": "number",
+          "default": 4096
+        },
+        "copilot-smart.autoDetect": {
+          "type": "boolean",
+          "default": true
+        },
+        "copilot-smart.ollamaPort": {
+          "type": "number",
+          "default": 11434
+        },
+        "copilot-smart.lmStudioPort": {
+          "type": "number",
+          "default": 1234
+        },
+        "copilot-smart.llamaCppPort": {
+          "type": "number",
+          "default": 8080
+        },
+        "copilot-smart.smartTaskMaxAgents": {
+          "type": "number",
+          "default": 12,
+          "minimum": 4,
+          "maximum": 24,
+          "description": "Maximum number of project-specific agents created for Smart Local Task."
+        },
+        "copilot-smart.smartTaskAutoApply": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically apply code changes returned by implementation/fixer agents."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "copilot-smart",
+          "title": "Copilot Smart",
+          "icon": "./copilot-smart.svg"
+        }
+      ]
+    },
+    "views": {
+      "copilot-smart": [
+        {
+          "type": "webview",
+          "id": "copilot-smart.controlCenter",
+          "name": "Control Center",
+          "when": "true"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "copilot-smart.openSettings",
+          "when": "view == copilot-smart.controlCenter",
+          "group": "navigation@1"
+        },
+        {
+          "command": "copilot-smart.refreshStatus",
+          "when": "view == copilot-smart.controlCenter",
+          "group": "navigation@2"
+        }
+      ]
+    }
+  },
+  "icon": "icon.png"
+}
