@@ -1,4 +1,3 @@
-
 const vscode = require("vscode");
 const fs = require("fs");
 const path = require("path");
@@ -257,7 +256,8 @@ async function openSettingsPanel(context) {
     vscode.ViewColumn.One,
     {enableScripts: true}
   );
-
+  // Initialize the webview only once.
+  panel.webview.html = settingsHtml(loadConfig());
   settingsPanel = panel;
   panel.onDidDispose(() => {
     if (settingsPanel === panel) settingsPanel = undefined;
@@ -304,14 +304,20 @@ async function openSettingsPanel(context) {
 async function refreshSettingsPanel(panel, modelResult) {
   if (!panel || panel !== settingsPanel) return;
 
-  const cfg = loadConfig();
-  panel.webview.html = settingsHtml(cfg);
-
   try {
+    const cfg = loadConfig();
     const result = modelResult || await discoverModels(cfg);
-    panel.webview.postMessage({type:"modelsResult", result});
-  } catch (_) {
-    // The settings page remains usable even when model discovery is offline.
+
+    // Update the existing webview instead of reloading its HTML.
+    panel.webview.postMessage({
+      type: "modelsResult",
+      result
+    });
+  } catch (e) {
+    panel.webview.postMessage({
+      type: "error",
+      error: e.message
+    });
   }
 }
 
@@ -929,9 +935,13 @@ class CopilotSmartSidebarProvider {
   }
 
   refresh() {
-    if (this.view) this.view.webview.html = this.html();
-  }
+    if (!this.view) return;
 
+    // Do not recreate the webview document.
+    this.view.webview.postMessage({
+      command: "refreshDisplay"
+    });
+  }
   html() {
     const cfg = loadConfig();
     const p = providerName(cfg);
