@@ -1,4 +1,3 @@
-
 const vscode = require("vscode");
 const fs = require("fs");
 const path = require("path");
@@ -114,7 +113,7 @@ async function probe(url, timeout = 2500) {
     const data = await requestJson(url, {timeout});
     return {ok: true, data};
   } catch (e) {
-    return {ok: false, error: e.message};
+    return {ok: false, error: e.message, statusCode: e.statusCode, response: e.response};
   }
 }
 
@@ -142,7 +141,7 @@ async function discoverModels(cfg) {
   };
 
   const ollama = await probe(`http://${cfg.host}:${cfg.ollamaPort}/api/tags`, Math.min(cfg.timeoutMs, 5000));
-  if (ollama.ok && Array.isArray(ollama.data.models)) {
+  if (ollama.ok && Array.isArray(ollama.data?.models)) {
     for (const m of ollama.data.models) add("ollama", cfg.ollamaPort, m.name);
   }
 
@@ -164,11 +163,55 @@ async function discoverModels(cfg) {
 }
 
 async function testConnection(cfg) {
-  if (providerName(cfg) === "ollama") {
-    const native = await probe(`http://${cfg.host}:${cfg.port}/api/tags`, Math.min(cfg.timeoutMs, 10000));
-    if (native.ok) return native;
+  const provider = providerName(cfg);
+  const timeout = Math.min(Number(cfg.timeoutMs) || 120000, 10000);
+
+  // Ollama has two APIs. Use the native API as the authoritative health check
+  // and keep the OpenAI-compatible /v1 API available for inference.
+  if (provider === "ollama") {
+    const nativeUrl = `http://${cfg.host}:${cfg.port}/api/tags`;
+    const native = await probe(nativeUrl, timeout);
+    if (native.ok) {
+      return {
+        ...native,
+        provider,
+        endpoint: nativeUrl,
+        api: "ollama-native",
+        modelCount: Array.isArray(native.data?.models) ? native.data.models.length : 0
+      };
+    }
+
+    // If native API fails, test /v1/models as a fallback diagnostic. This
+    // makes the actual failure visible instead of reporting a generic offline
+    // state when the OpenAI-compatible endpoint is still available.
+    const openaiUrl = endpoint(cfg) + "/models";
+    const openai = await probe(openaiUrl, timeout);
+    if (openai.ok) {
+      return {
+        ...openai,
+        provider,
+        endpoint: openaiUrl,
+        api: "openai-compatible",
+        modelCount: Array.isArray(openai.data?.data) ? openai.data.data.length : 0,
+        warning: `Ollama native API failed: ${native.error || "unknown error"}`
+      };
+    }
+
+    return {
+      ok: false,
+      provider,
+      endpoint: nativeUrl,
+      error: native.error || openai.error || "Ollama connection failed.",
+      statusCode: native.statusCode || openai.statusCode,
+      response: native.response || openai.response,
+      nativeError: native.error,
+      openaiError: openai.error
+    };
   }
-  return await probe(endpoint(cfg) + "/models", Math.min(cfg.timeoutMs, 10000));
+
+  const url = endpoint(cfg) + "/models";
+  const result = await probe(url, timeout);
+  return {...result, provider, endpoint: url};
 }
 
 function providerName(cfg) {
@@ -292,6 +335,8 @@ async function openSettingsPanel(context) {
         const r = await discoverModels(loadConfig());
         const file = generateProvider(loadConfig(), r.models);
         panel.webview.postMessage({type:"providerResult", file});
+      } else if (msg.type === "history") {
+        showChatHistoryQuickPick();
       }
     } catch (e) {
       panel.webview.postMessage({type:"error", error:e.message});
@@ -350,6 +395,7 @@ pre{white-space:pre-wrap;background:var(--vscode-textCodeBlock-background);paddi
 <div><label>Auto detect</label><select id="autoDetect"><option value="true">true</option><option value="false">false</option></select></div>
 </div></div>
 <div class="card"><button onclick="save()">Save</button><button onclick="detect()">Detect</button><button onclick="models()">Discover Models</button><button onclick="test()">Test Connection</button><button onclick="provider()">Generate provider.json</button></div>
+<div class="card"><h2>Chat Session History</h2><p>Smart Local Task sessions are stored locally at <code>~/.copilot-smart/chat-history.json</code>. Code backups are stored under each task run directory.</p><button onclick="history()">Open Session History</button></div>
 <div class="card"><h2>Result</h2><pre id="result">Ready.</pre></div>
 <script>
 const vscode=acquireVsCodeApi();
@@ -363,6 +409,7 @@ function detect(){vscode.postMessage({type:"detect"});}
 function models(){vscode.postMessage({type:"models"});}
 function test(){vscode.postMessage({type:"test"});}
 function provider(){vscode.postMessage({type:"provider"});}
+function history(){vscode.postMessage({type:"history"});}
 window.addEventListener("message",e=>{
   const m=e.data;
   const result=document.getElementById("result");
@@ -586,17 +633,239 @@ async function runCommand(root, command, timeoutMs = 120000) {
   });
 }
 
-async function startSmartLocalTask() {
+
+const CHAT_HISTORY_FILE = path.join(CONFIG_DIR, "chat-history.json");
+const CHAT_HISTORY_LIMIT = 50;
+
+function loadChatHistory() {
+  ensureDir();
+  try {
+    if (!fs.existsSync(CHAT_HISTORY_FILE)) return [];
+    const data = JSON.parse(fs.readFileSync(CHAT_HISTORY_FILE, "utf8"));
+    return Array.isArray(data) ? data.slice(0, CHAT_HISTORY_LIMIT) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveChatHistory(history) {
+  ensureDir();
+  const safe = Array.isArray(history) ? history.slice(0, CHAT_HISTORY_LIMIT) : [];
+  const tmp = `${CHAT_HISTORY_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(safe, null, 2), "utf8");
+  fs.renameSync(tmp, CHAT_HISTORY_FILE);
+}
+
+function createChatSession(task, cfg, runId) {
+  const now = new Date().toISOString();
+  const session = {
+    id: runId,
+    title: String(task).trim().slice(0, 100) || "Smart Local Task",
+    task: String(task),
+    status: "running",
+    createdAt: now,
+    updatedAt: now,
+    finishedAt: null,
+    provider: providerName(cfg),
+    host: cfg.host,
+    port: cfg.port,
+    model: cfg.model,
+    mode: cfg.mode,
+    runId,
+    runDir: null,
+    backupDir: null,
+    changedFiles: [],
+    agents: [],
+    verification: null,
+    error: null
+  };
+  const history = loadChatHistory();
+  history.unshift(session);
+  saveChatHistory(history);
+  return session;
+}
+
+function updateChatSession(id, patch) {
+  const history = loadChatHistory();
+  const index = history.findIndex(x => x.id === id);
+  if (index < 0) return null;
+  history[index] = Object.assign({}, history[index], patch, {updatedAt: new Date().toISOString()});
+  saveChatHistory(history);
+  return history[index];
+}
+
+function deleteChatSession(id) {
+  saveChatHistory(loadChatHistory().filter(x => x.id !== id));
+}
+
+function chatHistorySummary() {
+  return loadChatHistory().map(x => ({
+    id: x.id,
+    title: x.title,
+    task: x.task,
+    status: x.status,
+    createdAt: x.createdAt,
+    updatedAt: x.updatedAt,
+    finishedAt: x.finishedAt,
+    model: x.model,
+    provider: x.provider,
+    runId: x.runId,
+    runDir: x.runDir,
+    backupDir: x.backupDir || (x.runDir ? path.join(x.runDir, "backup") : null),
+    changedFiles: x.changedFiles || [],
+    agents: (x.agents || []).map(a => typeof a === "string" ? a : a.name || a.role).filter(Boolean),
+    verification: x.verification || null,
+    error: x.error || null
+  }));
+}
+
+
+function sessionHistoryHtml(limit = 5) {
+  const history = loadChatHistory().slice(0, limit);
+  if (!history.length) {
+    return `<div class="history-empty">No Smart Local Task sessions yet.<br><span>Run a Smart Local Task to create a session backup.</span></div>`;
+  }
+  return history.map(x => {
+    const icon = x.status === "completed" ? "✓" : x.status === "failed" ? "✕" : "…";
+    const date = new Date(x.updatedAt || x.createdAt).toLocaleString();
+    const files = Array.isArray(x.changedFiles) ? x.changedFiles.length : 0;
+    return `<div class="history-item">
+      <div class="history-title">${esc(icon)} ${esc(x.title)}</div>
+      <div class="history-meta">${esc(x.status)} • ${esc(x.model || "no model")} • ${esc(date)}</div>
+      <div class="history-meta">${files} changed file(s)${x.runDir ? " • backup available" : ""}</div>
+      <button class="secondary" onclick="resume('${esc(x.id)}')">Resume</button>
+      ${x.runDir ? `<button class="secondary" onclick="openRun('${esc(x.id)}')">Open Run</button>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function sessionBackupPath(session) {
+  if (!session || !session.runDir) return null;
+  const backup = path.join(session.runDir, "backup");
+  return fs.existsSync(backup) ? backup : null;
+}
+
+async function resumeChatSession(id) {
+  const session = loadChatHistory().find(x => x.id === id);
+  if (!session) {
+    vscode.window.showErrorMessage("Copilot Smart: Chat session was not found.");
+    return;
+  }
+  if (!session.task) {
+    vscode.window.showErrorMessage("Copilot Smart: This session has no saved task.");
+    return;
+  }
+  await startSmartLocalTask(session.task, session);
+}
+
+function showChatHistoryQuickPick() {
+  const history = loadChatHistory();
+  if (!history.length) {
+    vscode.window.showInformationMessage(`Copilot Smart: No chat sessions yet. Sessions are saved in ${CHAT_HISTORY_FILE}`);
+    return;
+  }
+  const items = history.map(x => ({
+    label: `${x.status === "completed" ? "$(check)" : x.status === "failed" ? "$(error)" : "$(sync~spin)"} ${x.title}`,
+    description: `${x.model || "no model"} • ${x.status} • ${new Date(x.updatedAt || x.createdAt).toLocaleString()}`,
+    detail: `${x.changedFiles?.length || 0} changed file(s) • ${x.runDir || "no run directory"}`,
+    session: x
+  }));
+  vscode.window.showQuickPick(items, {placeHolder: "Select a Copilot Smart chat session"}).then(async pick => {
+    if (!pick) return;
+    const action = await vscode.window.showQuickPick([
+      {label:"$(debug-continue) Resume Session", value:"resume"},
+      {label:"$(folder-opened) Open Run Directory", value:"open"},
+      {label:"$(trash) Delete Session", value:"delete"}
+    ], {placeHolder: pick.session.title});
+    if (!action) return;
+    if (action.value === "resume") await resumeChatSession(pick.session.id);
+    else if (action.value === "open" && pick.session.runDir) {
+      await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(pick.session.runDir));
+    } else if (action.value === "delete") {
+      deleteChatSession(pick.session.id);
+      vscode.window.showInformationMessage("Copilot Smart: Session deleted.");
+    }
+  });
+}
+
+let taskProgressState = {
+  active: false,
+  percent: 0,
+  phase: "Idle",
+  message: "No Smart Local Task is running.",
+  runId: null,
+  task: ""
+};
+
+let sidebarProviderInstance = null;
+let controlCenterProviderInstance = null;
+
+function taskProgressUpdate(percent, phase, message, extra = {}) {
+  taskProgressState = {
+    ...taskProgressState,
+    active: extra.active !== undefined ? extra.active : true,
+    percent: Math.max(0, Math.min(100, Math.round(percent))),
+    phase: phase || taskProgressState.phase,
+    message: message || taskProgressState.message,
+    ...extra
+  };
+
+  if (sidebarProviderInstance) sidebarProviderInstance.sendTaskProgress();
+  if (controlCenterProviderInstance) controlCenterProviderInstance.sendTaskProgress();
+}
+
+function taskProgressHtml() {
+  const p = taskProgressState;
+  const display = p.active ? "block" : "none";
+  const percent = p.active ? p.percent : 0;
+  const phase = esc(p.active ? p.phase : "Idle");
+  const message = esc(p.active ? p.message : "No Smart Local Task is running.");
+  const task = esc(p.task || "");
+
+  return `<div id="taskProgress" class="task-progress" style="display:${display}">
+    <div class="task-progress-head">
+      <span>✦ Smart Local Task</span>
+      <strong id="taskProgressPercent">${percent}%</strong>
+    </div>
+    <div class="task-progress-track"><div id="taskProgressBar" class="task-progress-bar" style="width:${percent}%"></div></div>
+    <div id="taskProgressPhase" class="task-progress-phase">${phase}</div>
+    <div id="taskProgressMessage" class="task-progress-message">${message}</div>
+    ${task ? `<div class="task-progress-task">${task}</div>` : ""}
+  </div>`;
+}
+
+function taskProgressScript() {
+  return `
+function updateTaskProgress(p) {
+  const box = document.getElementById("taskProgress");
+  if (!box) return;
+  if (!p.active) { box.style.display = "none"; return; }
+  box.style.display = "block";
+  const bar = document.getElementById("taskProgressBar");
+  const pct = document.getElementById("taskProgressPercent");
+  const phase = document.getElementById("taskProgressPhase");
+  const message = document.getElementById("taskProgressMessage");
+  if (bar) bar.style.width = Math.max(0, Math.min(100, p.percent || 0)) + "%";
+  if (pct) pct.textContent = (p.percent || 0) + "%";
+  if (phase) phase.textContent = p.phase || "Working...";
+  if (message) message.textContent = p.message || "";
+}`;
+}
+
+async function startSmartLocalTask(taskOverride = null, resumeSession = null) {
   const root = projectRoot();
   if (!root) {
     vscode.window.showErrorMessage("Copilot Smart: Open a project folder/workspace first.");
     return;
   }
-  const task = await vscode.window.showInputBox({
-    prompt:"Smart Local Task — describe what you want built",
-    placeHolder:"Example: Add OAuth login, tests, error handling, and update the documentation",
-    ignoreFocusOut:true
-  });
+  let task = taskOverride;
+  if (!task) {
+    task = await vscode.window.showInputBox({
+      prompt:"Smart Local Task — describe what you want built",
+      placeHolder:"Example: Add OAuth login, tests, error handling, and update the documentation",
+      ignoreFocusOut:true
+    });
+  }
   if (!task) return;
 
   const cfg = loadConfig();
@@ -606,20 +875,32 @@ async function startSmartLocalTask() {
   }
 
   const runId = new Date().toISOString().replace(/[:.]/g,"-");
+  const session = createChatSession(task, cfg, runId);
+  if (resumeSession) {
+    updateChatSession(runId, {
+      resumedFrom: resumeSession.id,
+      resumeCount: Number(resumeSession.resumeCount || 0) + 1,
+      previousRunDir: resumeSession.runDir || null
+    });
+  }
+  taskProgressUpdate(2, "Project Analysis", "Reading the full project...", {active:true, runId, task});
   const output = await vscode.window.withProgress({
     location:vscode.ProgressLocation.Notification,
     title:"Copilot Smart: building autonomous coding team",
     cancellable:false
   }, async progress => {
-    progress.report({message:"Reading the full project..."});
+    progress.report({increment:2, message:"Reading the full project..."});
     const index = buildProjectIndex(root);
     const originalContents = {...index.contents};
     const map = projectMap(index);
 
-    progress.report({message:`Reading ${index.files.length} project files in analysis passes...`});
+    taskProgressUpdate(8, "Project Analysis", `Reading ${index.files.length} project files in analysis passes...`);
+    progress.report({increment:6, message:`Reading ${index.files.length} project files in analysis passes...`});
     const chunks = projectContentChunks(index, 60000);
     const analysisNotes = [];
     for (let i = 0; i < chunks.length; i++) {
+      const analysisPercent = 10 + Math.round(((i + 1) / Math.max(1, chunks.length)) * 25);
+      taskProgressUpdate(analysisPercent, "Project Analysis", `Analyzing project context ${i + 1}/${chunks.length}...`);
       progress.report({message:`Analyzing project context ${i + 1}/${chunks.length}...`});
       const note = await runAgent(cfg, {
         role:"Repository Analyst",
@@ -628,6 +909,7 @@ async function startSmartLocalTask() {
       analysisNotes.push(note);
     }
 
+    taskProgressUpdate(38, "Agent Planning", "Generating project-specific agents...");
     progress.report({message:"Generating project-specific agents..."});
     const planRaw = await runAgent(cfg, {
       role:"Lead Architect / Agent Orchestrator",
@@ -649,14 +931,19 @@ async function startSmartLocalTask() {
 
     // Architect agents first. They receive the complete project map plus source/config content.
     for (const agent of agents.filter(a => /architect|analysis|analyst|explorer|planner/i.test(`${a.name} ${a.role}`)).slice(0,3)) {
+      taskProgressUpdate(45, "Architecture", `Running ${agent.name}...`);
       progress.report({message:`Running ${agent.name}...`});
       const r = await runAgent(cfg, agent, task, map + "\\n\\nPROJECT FILE CONTENT:\\n" + relevantFiles(index, [], 220000));
       results.push({agent:agent.name, role:agent.role, output:r});
     }
 
+    taskProgressUpdate(55, "Implementation", "Running implementation team...");
     progress.report({message:"Running implementation team..."});
     const implementationAgents = agents.filter(a => !/architect|analysis|analyst|explorer|planner/i.test(`${a.name} ${a.role}`));
-    for (const agent of implementationAgents.slice(0,8)) {
+    for (let agentIndex = 0; agentIndex < implementationAgents.slice(0,8).length; agentIndex++) {
+      const agent = implementationAgents.slice(0,8)[agentIndex];
+      const implementationPercent = 55 + Math.round(((agentIndex + 1) / Math.max(1, implementationAgents.slice(0,8).length)) * 25);
+      taskProgressUpdate(implementationPercent, "Implementation", `Running ${agent.name} (${agentIndex + 1}/${implementationAgents.slice(0,8).length})...`);
       const context = map + "\\n\\nSOURCE FILES:\\n" + relevantFiles(index, [], 220000);
       const r = await runAgent(cfg, agent, task, context + "\\n\\nIMPLEMENTATION CONTRACT: If you modify code, return JSON {\\\"changes\\\":[{\\\"path\\\":\\\"relative/path\\\",\\\"content\\\":\\\"complete file content\\\",\\\"reason\\\":\\\"...\\\"}]}.");
       results.push({agent:agent.name, role:agent.role, output:r});
@@ -673,6 +960,7 @@ async function startSmartLocalTask() {
       }
     }
 
+    taskProgressUpdate(82, "Review & Verification", "Running verification and final review...");
     progress.report({message:"Running verification and final review..."});
     const currentIndex = buildProjectIndex(root);
     const reviewContext = projectMap(currentIndex) + "\\n\\nCURRENT SOURCE:\\n" + relevantFiles(currentIndex, [], 240000);
@@ -693,12 +981,14 @@ async function startSmartLocalTask() {
         const scripts = pkg.scripts || {};
         const command = scripts.test ? "npm test" : (scripts.lint ? "npm run lint" : (scripts.check ? "npm run check" : null));
         if (command) {
+          taskProgressUpdate(90, "Verification", `Running ${command}...`);
           progress.report({message:`Running ${command}...`});
           testResult = await runCommand(root, command, 180000);
         }
       } catch (_) {}
     }
     if (!testResult && files["pyproject.toml"] && files["tests/test_main.py"]) {
+      taskProgressUpdate(90, "Verification", "Running Python tests...");
       progress.report({message:"Running Python tests..."});
       testResult = await runCommand(root, "python -m pytest", 180000);
     }
@@ -707,11 +997,26 @@ async function startSmartLocalTask() {
     const finalIndex = buildProjectIndex(root);
     finalRun.changedFiles = Object.keys(finalIndex.contents).filter(p => originalContents[p] !== finalIndex.contents[p]);
     fs.writeFileSync(path.join(runDir,"run.json"), JSON.stringify(finalRun,null,2));
+    taskProgressUpdate(100, "Complete", "Smart Local Task completed.", {active:false});
     return {runDir, agents, results, testResult};
   });
 
   const changed = output.changedFiles.length;
   const testText = output.testResult ? (output.testResult.ok ? "verification passed" : `verification failed (exit ${output.testResult.code})`) : "no unambiguous project test command found";
+  updateChatSession(runId, {
+    status: "completed",
+    finishedAt: new Date().toISOString(),
+    runDir: output.runDir,
+    backupDir: path.join(output.runDir, "backup"),
+    changedFiles: output.changedFiles,
+    agents: output.agents,
+    verification: output.testResult ? {
+      ok: output.testResult.ok,
+      code: output.testResult.code,
+      stdout: output.testResult.stdout,
+      stderr: output.testResult.stderr
+    } : null
+  });
   vscode.window.showInformationMessage(`Copilot Smart: Smart Local Task complete — ${output.agents.length} agents, ${changed} changed files, ${testText}.`);
   const doc = await vscode.workspace.openTextDocument({
     content:`# Copilot Smart — Smart Local Task\\n\\nTask: ${task}\\n\\nAgents: ${output.agents.map(a=>a.name).join(", ")}\\n\\nChanged files: ${changed}\\n\\nRun data: ${output.runDir}\\n\\n${output.testResult ? `## Verification\\n\\n${output.testResult.stdout}\\n${output.testResult.stderr}` : "No unambiguous test command was detected."}`,
@@ -750,20 +1055,26 @@ function setStatusAppearance(state, text, tooltip) {
 async function getLocalStatus(cfg) {
   try {
     const r = await testConnection(cfg);
+    const provider = providerName(cfg);
+    const displayEndpoint = endpoint(cfg);
+    const healthEndpoint = r.endpoint || displayEndpoint;
 
     if (r.ok) {
+      const count = Number.isFinite(r.modelCount) ? `\nModels: ${r.modelCount}` : "";
+      const warning = r.warning ? `\nWarning: ${r.warning}` : "";
+
       if (!cfg.model) {
         return {
           state: "waiting",
           text: "$(debug-pause)",
-          tooltip: `Local ${providerName(cfg)} server is connected, but no model is selected.\n${endpoint(cfg)}\nChoose a model from Copilot Smart → Discover Models.`
+          tooltip: `Local ${provider} server is connected, but no model is selected.\nHealth: ${healthEndpoint}\nInference: ${displayEndpoint}${count}${warning}\nChoose a model from Copilot Smart → Discover Models.`
         };
       }
 
       return {
         state: "ready",
         text: "$(rocket)",
-        tooltip: `Local LLM connected and ready.\nProvider: ${providerName(cfg)}\nModel: ${cfg.model}\nEndpoint: ${endpoint(cfg)}`
+        tooltip: `Local LLM connected and ready.\nProvider: ${provider}\nModel: ${cfg.model}\nHealth: ${healthEndpoint}\nInference: ${displayEndpoint}${count}${warning}`
       };
     }
 
@@ -771,14 +1082,17 @@ async function getLocalStatus(cfg) {
       return {
         state: "waiting",
         text: "$(key)",
-        tooltip: `Local server is reachable but authentication is required.\n${endpoint(cfg)}\nConfigure the API key in Copilot Smart Settings.`
+        tooltip: `Local server is reachable but authentication is required.\nProvider: ${provider}\nHealth: ${healthEndpoint}\nInference: ${displayEndpoint}\nConfigure the API key in Copilot Smart Settings.`
       };
     }
+
+    const details = [r.error, r.nativeError && `native: ${r.nativeError}`, r.openaiError && `OpenAI API: ${r.openaiError}`]
+      .filter(Boolean).join("\n");
 
     return {
       state: "offline",
       text: "$(error)",
-      tooltip: `Local LLM is not reachable.\n${endpoint(cfg)}\n${r.error || "Connection failed."}`
+      tooltip: `Local ${provider} is not reachable.\nHealth: ${healthEndpoint}\nInference: ${displayEndpoint}\n${details || "Connection failed."}`
     };
   } catch (e) {
     if (e.statusCode === 401 || e.statusCode === 403) {
@@ -792,7 +1106,7 @@ async function getLocalStatus(cfg) {
     return {
       state: "offline",
       text: "$(error)",
-      tooltip: `Local LLM is not reachable.\n${endpoint(cfg)}\n${e.message || "Connection failed."}`
+      tooltip: `Local ${providerName(cfg)} connection check failed.\n${endpoint(cfg)}\n${e.message || "Connection failed."}`
     };
   }
 }
@@ -895,12 +1209,18 @@ class CopilotSmartSidebarProvider {
   constructor(context) {
     this.context = context;
     this.view = undefined;
+    sidebarProviderInstance = this;
+  }
+
+  sendTaskProgress() {
+    if (this.view) this.view.webview.postMessage({type:"taskProgress", progress:taskProgressState});
   }
 
   resolveWebviewView(webviewView) {
     this.view = webviewView;
     webviewView.webview.options = {enableScripts: true};
     webviewView.webview.html = this.html();
+    this.sendTaskProgress();
 
     webviewView.webview.onDidReceiveMessage(async msg => {
       try {
@@ -918,6 +1238,14 @@ class CopilotSmartSidebarProvider {
           await vscode.commands.executeCommand("copilot-smart.status");
         } else if (msg.command === "task") {
           await vscode.commands.executeCommand("copilot-smart.startTask");
+        } else if (msg.command === "history") {
+          await vscode.commands.executeCommand("copilot-smart.chatHistory");
+        } else if (msg.command === "resume") {
+          await vscode.commands.executeCommand("copilot-smart.resumeChatSession", msg.id);
+          this.refresh();
+        } else if (msg.command === "openRun") {
+          const session = loadChatHistory().find(x => x.id === msg.id);
+          if (session && session.runDir) await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(session.runDir));
         } else if (msg.command === "refresh") {
           await vscode.commands.executeCommand("copilot-smart.refreshStatus");
           this.refresh();
@@ -979,11 +1307,29 @@ class CopilotSmartSidebarProvider {
     opacity: .55;
     margin: 14px 2px 5px;
   }
+  .history-item {
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 6px;
+    padding: 7px;
+    margin: 4px 0;
+  }
+  .history-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .history-meta { opacity: .65; font-size: 10px; margin-top: 3px; }
+  .history-empty { opacity: .65; padding: 6px 2px; line-height: 1.5; }
+  .task-progress { border:1px solid var(--vscode-panel-border); border-radius:8px; padding:10px; margin-bottom:12px; background:var(--vscode-editor-background); }
+  .task-progress-head { display:flex; justify-content:space-between; align-items:center; font-weight:600; margin-bottom:7px; }
+  .task-progress-track { height:7px; border-radius:5px; overflow:hidden; background:var(--vscode-progressBar-background); opacity:.35; }
+  .task-progress-bar { height:100%; border-radius:5px; background:var(--vscode-progressBar-background); transition:width .25s ease; opacity:1; }
+  .task-progress-phase { margin-top:7px; font-size:11px; font-weight:600; }
+  .task-progress-message { margin-top:3px; font-size:10px; opacity:.7; line-height:1.4; }
+  .task-progress-task { margin-top:6px; font-size:10px; opacity:.55; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 </style>
 </head>
 <body>
   <h2>Copilot Smart</h2>
   <div class="sub">Local LLM control center</div>
+
+  ${taskProgressHtml()}
 
   <div class="status">
     <div class="row"><span class="label">Mode:</span> ${esc(cfg.mode)}</div>
@@ -1003,12 +1349,22 @@ class CopilotSmartSidebarProvider {
   <button onclick="send('provider')">$(json) Generate provider.json</button>
   <button onclick="send('status')">$(info) Show Status</button>
 
+  <div class="section">Recent Sessions</div>
+  <div id="history">${sessionHistoryHtml(5)}</div>
+  <button onclick="send('history')">$(history) Open Full Chat History</button>
+
   <div class="section">Configuration</div>
   <button onclick="send('settings')">$(settings-gear) Open Settings</button>
 
 <script>
   const vscode = acquireVsCodeApi();
   function send(command) { vscode.postMessage({command}); }
+  function resume(id) { vscode.postMessage({command:"resume", id}); }
+  function openRun(id) { vscode.postMessage({command:"openRun", id}); }
+  window.addEventListener("message", event => {
+    if (event.data && event.data.type === "taskProgress") updateTaskProgress(event.data.progress);
+  });
+  ${taskProgressScript()}
 </script>
 </body>
 </html>`;
@@ -1020,12 +1376,18 @@ class ControlCenterProvider {
   constructor(context) {
     this.context = context;
     this.view = undefined;
+    controlCenterProviderInstance = this;
+  }
+
+  sendTaskProgress() {
+    if (this.view) this.view.webview.postMessage({type:"taskProgress", progress:taskProgressState});
   }
 
   resolveWebviewView(webviewView) {
     this.view = webviewView;
     webviewView.webview.options = { enableScripts: true };
     webviewView.webview.html = this.html();
+    this.sendTaskProgress();
 
     webviewView.webview.onDidReceiveMessage(async (msg) => {
       try {
@@ -1054,6 +1416,19 @@ class ControlCenterProvider {
             break;
           case "task":
             await vscode.commands.executeCommand("copilot-smart.startTask");
+            break;
+          case "history":
+            await vscode.commands.executeCommand("copilot-smart.chatHistory");
+            break;
+          case "resume":
+            await vscode.commands.executeCommand("copilot-smart.resumeChatSession", msg.id);
+            await this.sendStatus();
+            break;
+          case "openRun":
+            {
+              const session = loadChatHistory().find(x => x.id === msg.id);
+              if (session && session.runDir) await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(session.runDir));
+            }
             break;
           case "refresh":
             await vscode.commands.executeCommand("copilot-smart.refreshStatus");
@@ -1166,6 +1541,8 @@ button:hover { background:var(--vscode-button-hoverBackground); }
   <div><div class="title">Copilot Smart</div><div class="sub">Local LLM Control Center</div></div>
 </div>
 
+${taskProgressHtml()}
+
 <div class="card">
   <div class="status"><span id="dot" class="dot"></span><span id="state">Checking...</span></div>
   <div id="meta" class="meta">Checking local and cloud connection...</div>
@@ -1185,20 +1562,30 @@ button:hover { background:var(--vscode-button-hoverBackground); }
 <button onclick="cmd('test')">✓ Test Connection</button>
 <button onclick="cmd('refresh')" class="secondary">↻ Refresh Status</button>
 
+<div class="section">Recent Sessions</div>
+<div class="card">${sessionHistoryHtml(3)}<button onclick="cmd('history')" class="secondary">Open Full Chat History</button></div>
+
 <div class="section">Tools</div>
 <button onclick="cmd('provider')">⇄ Generate provider.json</button>
 <button onclick="cmd('task')">✦ Smart Local Task</button>
+<button onclick="cmd('history')">◷ Chat Session History</button>
 <button onclick="cmd('status')" class="secondary">ⓘ Show Status</button>
 
 <script>
 const vscode = acquireVsCodeApi();
 function cmd(command){ vscode.postMessage({command}); }
+function resume(id){ vscode.postMessage({command:"resume", id}); }
+function openRun(id){ vscode.postMessage({command:"openRun", id}); }
 document.getElementById("modelSelect").addEventListener("change", function(){
   const opt=this.options[this.selectedIndex];
   if(opt && opt.dataset.model){
     vscode.postMessage({command:"selectModel", model:opt.dataset.model, provider:opt.dataset.provider, port:opt.dataset.port});
   }
 });
+window.addEventListener("message", event => {
+  if (event.data && event.data.type === "taskProgress") updateTaskProgress(event.data.progress);
+});
+${taskProgressScript()}
 window.addEventListener('message', e => {
   const m=e.data;
   if(m.type==="models"){
@@ -1234,7 +1621,7 @@ window.addEventListener('message', e => {
   const state=document.getElementById("state");
   const meta=document.getElementById("meta");
   dot.className="dot";
-  if(m.local.state==="local"){
+  if(m.local.state==="ready"){
     dot.classList.add("local");
     state.textContent="LOCAL • "+m.provider;
     meta.textContent=m.model+" • "+m.endpoint+" • "+m.mode;
@@ -1301,6 +1688,8 @@ function activate(context) {
       } catch(e) { vscode.window.showErrorMessage(e.message); }
     }),
     vscode.commands.registerCommand("copilot-smart.status", status),
+    vscode.commands.registerCommand("copilot-smart.chatHistory", showChatHistoryQuickPick),
+    vscode.commands.registerCommand("copilot-smart.resumeChatSession", resumeChatSession),
     vscode.commands.registerCommand("copilot-smart.refreshStatus", updateStatusBar),
     vscode.commands.registerCommand("copilot-smart.refreshModels", async () => {
       const r = await discoverModels(loadConfig());
