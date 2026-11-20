@@ -2,7 +2,7 @@
   "name": "copilot-smart",
   "displayName": "Copilot Smart",
   "description": "Use local Ollama, LM Studio, llama.cpp, or OpenAI-compatible local LLMs with strict-local controls.",
-  "version": "2.2.3",
+  "version": "2.2.5",
   "publisher": "anbi",
   "license": "MIT",
   "engines": {
@@ -55,6 +55,10 @@
       {
         "command": "copilot-smart.refreshModels",
         "title": "Copilot Smart: Refresh Models"
+      },
+      {
+        "command": "copilot-smart.initialProject",
+        "title": "Copilot Smart: initial project"
       }
     ],
     "configuration": {

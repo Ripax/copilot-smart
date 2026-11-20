@@ -55,6 +55,10 @@
       {
         "command": "copilot-smart.refreshModels",
         "title": "Copilot Smart: Refresh Models"
+      },
+      {
+        "command": "copilot-smart.initialProject",
+        "title": "Copilot Smart: initial project"
       }
     ],
     "configuration": {
